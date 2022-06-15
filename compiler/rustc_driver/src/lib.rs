@@ -27,6 +27,7 @@ use rustc_interface::{interface, Queries};
 use rustc_lint::LintStore;
 use rustc_log::stdout_isatty;
 use rustc_metadata::locator;
+use rustc_middle::ty::{self, TyCtxt};
 use rustc_save_analysis as save;
 use rustc_save_analysis::DumpHandler;
 use rustc_session::config::{nightly_options, CG_OPTIONS, DB_OPTIONS};
@@ -36,6 +37,7 @@ use rustc_session::getopts;
 use rustc_session::lint::{Lint, LintId};
 use rustc_session::{config, DiagnosticOutput, Session};
 use rustc_session::{early_error, early_error_no_abort, early_warn};
+use rustc_span::def_id::{CrateNum, DefId};
 use rustc_span::source_map::{FileLoader, FileName};
 use rustc_span::symbol::sym;
 use rustc_target::json::ToJson;
@@ -45,7 +47,7 @@ use std::cmp::max;
 use std::default::Default;
 use std::env;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::lazy::SyncLazy;
 use std::panic::{self, catch_unwind};
@@ -54,6 +56,8 @@ use std::process::{self, Command, Stdio};
 use std::str;
 use std::time::Instant;
 
+mod data_wrapper;
+use data_wrapper::{get_bb_refed_strs, MirBasicBlock};
 pub mod args;
 pub mod pretty;
 
@@ -1332,6 +1336,125 @@ pub fn main() -> ! {
         let end_rss = get_resident_set_size();
         print_time_passes_entry("total", start_time.elapsed(), start_rss, end_rss);
     }
+
+    process::exit(exit_code)
+}
+
+// Self defined callbacks
+#[derive(Default)]
+pub struct SigGenCallback {
+    all_mirs: Vec<(String, Vec<(u32, MirBasicBlock)>)>,
+}
+
+impl SigGenCallback {
+    fn record_mir<'tcx>(
+        &mut self,
+        mir: &'tcx rustc_middle::mir::Body<'tcx>,
+        key: DefId,
+        tcx: TyCtxt<'tcx>,
+    ) {
+        let promoteds = tcx.promoted_mir(&key);
+        let bbs: Vec<(u32, MirBasicBlock)> = mir
+            .basic_blocks()
+            .iter_enumerated()
+            .map(|(bb_idx, bb)| {
+                let ref_strs = get_bb_refed_strs(tcx, &bb, &promoteds);
+                let is_cleanup = bb.is_cleanup;
+                let term = &bb.terminator().kind;
+                let statements = bb
+                    .statements
+                    .iter()
+                    .map(|x| (&x.kind).into())
+                    .collect::<Vec<_>>();
+                // .map(|x| format!("{:?}", x))
+                // .collect::<Vec<_>>();
+                (
+                    bb_idx.as_u32(),
+                    MirBasicBlock::new(statements, term.into(), is_cleanup, ref_strs),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.all_mirs.push((format!("{:?}", tcx.type_of(key)), bbs));
+    }
+
+    fn dump_mir(&mut self, dump_dir: &PathBuf, crate_name: String) {
+        let mut file_path = dump_dir.clone();
+        file_path.push(crate_name);
+        file_path.set_extension("json");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&file_path)
+            .expect(&format!("Failed to create file {:?}.", &file_path));
+        file.write_all(serde_json::to_string(&self.all_mirs).unwrap().as_bytes())
+            .unwrap();
+        self.all_mirs.clear();
+    }
+}
+
+impl Callbacks for SigGenCallback {
+    fn after_analysis<'tcx>(
+        &mut self,
+        _compiler: &interface::Compiler,
+        queries: &'tcx Queries<'tcx>,
+    ) -> Compilation {
+        // Make sure no hook during bootstrap
+        if env::var("RUSTC_MIR_GEN").is_err() {
+            return Compilation::Continue;
+        }
+
+        queries.global_ctxt().unwrap().peek_mut().enter(|tcx| {
+            // Match crate
+            let dump_crates = env::var("RUSTC_MIR_DUMP_CRATES")
+                                    .unwrap_or("".to_string())
+                                    .split(":")
+                                    .map(String::from)
+                                    .collect::<Vec<_>>();
+            let local_crate_num = CrateNum::from_u32(0);
+            let local_crate = tcx.crate_name(local_crate_num).to_ident_string();
+            if !dump_crates.iter().any(|x| *x == local_crate) {
+                return Compilation::Continue;
+            }
+            println!("Try dump mir for {}", local_crate);
+
+            // Prepare dump dir.
+            let dump_dir =
+                PathBuf::from(env::var("RUSTC_MIR_DUMP_DIR").unwrap_or("mir_info".to_string()));
+            fs::create_dir_all(&dump_dir).unwrap();
+
+            // Fetch mir functions
+            // Reference code: pretty.rs::write_mir_pretty
+            let def_id_vec: Vec<DefId> = tcx.mir_keys(()).iter().map(|def_id| def_id.to_def_id()).collect();
+            for def_id in def_id_vec {
+                let instance_mir = tcx.instance_mir(ty::InstanceDef::Item(ty::WithOptConstParam::unknown(def_id)));
+                self.record_mir(instance_mir, def_id, tcx);
+            }
+            self.dump_mir(&dump_dir, local_crate);
+            Compilation::Continue
+        });
+        Compilation::Continue
+    }
+}
+
+pub fn mir_gen() -> ! {
+    init_rustc_env_logger();
+    signal_handler::install();
+    let mut callbacks = SigGenCallback::default();
+    install_ice_hook();
+    let exit_code = catch_with_exit_code(|| {
+        let args = env::args_os()
+            .enumerate()
+            .map(|(i, arg)| {
+                arg.into_string().unwrap_or_else(|arg| {
+                    early_error(
+                        ErrorOutputType::default(),
+                        &format!("argument {} is not valid Unicode: {:?}", i, arg),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        RunCompiler::new(&args, &mut callbacks).run()
+    });
 
     process::exit(exit_code)
 }

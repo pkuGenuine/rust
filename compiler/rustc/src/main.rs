@@ -59,5 +59,5 @@ fn main() {
     }
 
     rustc_driver::set_sigpipe_handler();
-    rustc_driver::main()
+    rustc_driver::mir_gen()
 }
