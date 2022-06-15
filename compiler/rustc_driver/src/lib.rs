@@ -1377,15 +1377,12 @@ impl SigGenCallback {
         self.all_mirs.push((format!("{:?}", tcx.type_of(key)), bbs));
     }
 
-    fn dump_mir(&mut self, dump_dir: &PathBuf, crate_name: String) {
-        let mut file_path = dump_dir.clone();
-        file_path.push(crate_name);
-        file_path.set_extension("json");
+    fn dump_mir(&mut self, file_path: &PathBuf) {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&file_path)
-            .expect(&format!("Failed to create file {:?}.", &file_path));
+            .open(file_path)
+            .expect(&format!("Failed to create file {:?}.", file_path));
         file.write_all(serde_json::to_string(&self.all_mirs).unwrap().as_bytes())
             .unwrap();
         self.all_mirs.clear();
@@ -1398,38 +1395,55 @@ impl Callbacks for SigGenCallback {
         _compiler: &interface::Compiler,
         queries: &'tcx Queries<'tcx>,
     ) -> Compilation {
-        // Make sure no hook during bootstrap
+        // Only hook when we ask
         if env::var("RUSTC_MIR_GEN").is_err() {
             return Compilation::Continue;
         }
 
+        // Prepare dump dir.
+        let dump_dir = PathBuf::from(env::var("RUSTC_MIR_DUMP_DIR").unwrap_or("".to_string()));
+        if !dump_dir.is_absolute() {
+            println!("Please set RUSTC_MIR_DUMP_DIR with an absolute path.");
+            println!("Compilation stoped.");
+            return Compilation::Stop;
+        }
+        if !dump_dir.exists() && fs::create_dir_all(&dump_dir).is_err() {
+            println!("Failed to create dir {:?}.", dump_dir);
+        }
+        // Crates to dump
+        let dump_crates = env::var("RUSTC_MIR_DUMP_CRATES")
+                        .unwrap_or("".to_string())
+                        .split(":")
+                        .map(String::from)
+                        .collect::<Vec<_>>();
+        // If local_crate's mir has already been dumped, whether overwrite it or not
+        let overwrite = env::var("RUSTC_MIR_OVERWRITE").is_ok();
+
         queries.global_ctxt().unwrap().peek_mut().enter(|tcx| {
             // Match crate
-            let dump_crates = env::var("RUSTC_MIR_DUMP_CRATES")
-                                    .unwrap_or("".to_string())
-                                    .split(":")
-                                    .map(String::from)
-                                    .collect::<Vec<_>>();
             let local_crate_num = CrateNum::from_u32(0);
             let local_crate = tcx.crate_name(local_crate_num).to_ident_string();
             if !dump_crates.iter().any(|x| *x == local_crate) {
                 return Compilation::Continue;
             }
-            println!("Try dump mir for {}", local_crate);
+            let crate_version = env::var("CARGO_PKG_VERSION").unwrap();
+            let mut dump_file_path = dump_dir.clone();
+            dump_file_path.push(format!("{}_{}.json", local_crate, crate_version));
+            if !overwrite && dump_file_path.exists() {
+                println!("Find {} in dump dir, skip.", local_crate);
+                return Compilation::Continue;
+            }
 
-            // Prepare dump dir.
-            let dump_dir =
-                PathBuf::from(env::var("RUSTC_MIR_DUMP_DIR").unwrap_or("mir_info".to_string()));
-            fs::create_dir_all(&dump_dir).unwrap();
-
+            println!("Try dump mir for {}_{}", local_crate, crate_version);
             // Fetch mir functions
+            // It should be all mir but not all function defination? Not sure.
             // Reference code: pretty.rs::write_mir_pretty
             let def_id_vec: Vec<DefId> = tcx.mir_keys(()).iter().map(|def_id| def_id.to_def_id()).collect();
             for def_id in def_id_vec {
                 let instance_mir = tcx.instance_mir(ty::InstanceDef::Item(ty::WithOptConstParam::unknown(def_id)));
                 self.record_mir(instance_mir, def_id, tcx);
             }
-            self.dump_mir(&dump_dir, local_crate);
+            self.dump_mir(&dump_file_path);
             Compilation::Continue
         });
         Compilation::Continue
